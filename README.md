@@ -56,6 +56,30 @@ python mesh_render.py other.json --input-coordinates y_up --camera-yaw 180
 python mesh_render.py other.json --use-face
 ```
 
+### Single SMPL-X JSON on a headless NVIDIA server
+
+Use EGL when the server has no `$DISPLAY`. In headless mode, `--width` and
+`--height` are the actual output dimensions and only `frame`/`video` modes are
+available.
+
+```bash
+python mesh_render.py /path/to/motion.json \
+  --mode video \
+  --headless \
+  --models /path/to/body_models \
+  --output rendered_motion.mp4 \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+
+# Export one PNG instead.
+python mesh_render.py /path/to/motion.json \
+  --mode frame --frame 0 --headless \
+  --models /path/to/body_models \
+  --output rendered_motion.png \
+  --width 1440 --height 1440
+```
+
 ## Batch render all MotionFix samples
 
 The batch renderer creates one AITViewer/OpenGL context for the complete run,

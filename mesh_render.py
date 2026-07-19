@@ -7,12 +7,14 @@ import sys
 import tempfile
 from pathlib import Path
 
+import moderngl
 import numpy as np
 import torch
 from PIL import Image
 from scipy.spatial.transform import Rotation
 
 from aitviewer.configuration import CONFIG as C
+from aitviewer.headless import HeadlessRenderer
 from aitviewer.models.smpl import SMPLLayer
 from aitviewer.renderables.smpl import SMPLSequence
 from aitviewer.scene.camera import PinholeCamera
@@ -38,7 +40,16 @@ def parse_args():
         help="both exports the video first and then opens the interactive viewer",
     )
     parser.add_argument("--output", default=None, help="output PNG/MP4 path")
-    parser.add_argument("--models", default=DEFAULT_MODELS, help="directory containing SMPL-X models")
+    default_models = os.environ.get("SMPLX_MODELS")
+    if default_models is None:
+        default_models = (
+            DEFAULT_MODELS if Path(DEFAULT_MODELS).is_dir() else str(C.smplx_models)
+        )
+    parser.add_argument(
+        "--models",
+        default=default_models,
+        help="directory containing SMPL-X models (or set SMPLX_MODELS)",
+    )
     parser.add_argument("--gender", choices=("neutral", "female", "male"), default="neutral")
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument(
@@ -68,14 +79,33 @@ def parse_args():
         help="degrees around world Y; use 180 if the automatically chosen view shows the back",
     )
     parser.add_argument("--frame", type=int, default=0)
-    parser.add_argument("--width", type=int, default=720, help="logical viewer width")
-    parser.add_argument("--height", type=int, default=720, help="logical viewer height")
+    parser.add_argument(
+        "--width", type=int, default=720, help="GUI logical width; headless output width"
+    )
+    parser.add_argument(
+        "--height", type=int, default=720, help="GUI logical height; headless output height"
+    )
     parser.add_argument("--samples", type=int, default=8, help="MSAA sample count")
     parser.add_argument(
         "--export-scale",
         type=float,
         default=None,
-        help="default uses display pixel ratio (2x on Retina, yielding 1440x1440)",
+        help="GUI default: display pixel ratio; headless default: 1.0",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="render without DISPLAY using an offscreen EGL OpenGL context",
+    )
+    parser.add_argument(
+        "--headless-backend",
+        default="egl",
+        help="ModernGL standalone context backend used by --headless",
+    )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        help="SMPL-X compute device; auto selects CUDA when available",
     )
     parser.add_argument("--ambient-strength", type=float, default=1.2)
     parser.add_argument("--light-strength", type=float, default=0.9)
@@ -100,6 +130,8 @@ def parse_args():
         parser.error("--fps must be positive")
     if not 0 <= args.video_crf <= 51:
         parser.error("--video-crf must be between 0 and 51")
+    if args.headless and args.mode in ("preview", "both"):
+        parser.error("--headless supports --mode frame or --mode video")
     return args
 
 
@@ -223,6 +255,39 @@ def find_ffmpeg():
     return executable
 
 
+def create_egl_headless_viewer(size, samples, backend):
+    """Create AITViewer's headless window with an explicit EGL backend."""
+
+    # Some AITViewer/moderngl_window versions do not forward ``backend`` from
+    # Viewer.__init__. Inject it only while this one context is constructed.
+    original_create_context = moderngl.create_standalone_context
+
+    def create_context_with_backend(*context_args, **context_kwargs):
+        context_kwargs.setdefault("backend", backend)
+        return original_create_context(*context_args, **context_kwargs)
+
+    moderngl.create_standalone_context = create_context_with_backend
+    try:
+        return HeadlessRenderer(size=size, samples=samples)
+    finally:
+        moderngl.create_standalone_context = original_create_context
+
+
+def describe_opengl(viewer, reject_software=False):
+    gl_vendor = str(viewer.ctx.info.get("GL_VENDOR", "unknown"))
+    gl_renderer = str(viewer.ctx.info.get("GL_RENDERER", "unknown"))
+    gl_version = str(viewer.ctx.info.get("GL_VERSION", "unknown"))
+    print(f"OpenGL: vendor={gl_vendor}, renderer={gl_renderer}, version={gl_version}")
+    if reject_software and any(
+        marker in gl_renderer.lower()
+        for marker in ("llvmpipe", "softpipe", "swrast", "software rasterizer")
+    ):
+        raise RuntimeError(
+            "Headless OpenGL is using a software renderer instead of the GPU: "
+            f"{gl_renderer}"
+        )
+
+
 def main():
     args = parse_args()
     input_path = Path(args.input).expanduser().resolve()
@@ -231,6 +296,10 @@ def main():
 
     C.smplx_models = str(Path(args.models).expanduser())
     C.auto_set_floor = False
+    if args.device == "auto":
+        compute_device = "cuda:0" if torch.cuda.is_available() else str(C.device)
+    else:
+        compute_device = args.device
 
     motion = load_smplx_json(input_path)
     root, trans = convert_global_coordinates(
@@ -245,7 +314,7 @@ def main():
         gender=args.gender,
         num_betas=10,
         num_expression_coeffs=10,
-        device=C.device,
+        device=compute_device,
     )
     sequence = SMPLSequence(
         poses_body=motion["body"],
@@ -282,7 +351,19 @@ def main():
     heading[1] = 0.0
     heading /= np.linalg.norm(heading)
 
-    viewer = Viewer(size=(args.width, args.height), samples=args.samples)
+    logical_size = (args.width, args.height)
+    if args.headless:
+        export_scale = 1.0 if args.export_scale is None else args.export_scale
+        export_size = (
+            int(round(args.width * export_scale)),
+            int(round(args.height * export_scale)),
+        )
+        viewer = create_egl_headless_viewer(
+            export_size, args.samples, args.headless_backend
+        )
+    else:
+        viewer = Viewer(size=logical_size, samples=args.samples)
+    describe_opengl(viewer, reject_software=args.headless)
     viewer.playback_fps = args.fps
     viewer.scene.add(sequence)
     viewer.scene.origin.enabled = False
@@ -311,8 +392,8 @@ def main():
     camera = PinholeCamera(
         camera_position,
         camera_target,
-        args.width,
-        args.height,
+        viewer.window_size[0],
+        viewer.window_size[1],
         fov=args.camera_fov,
         viewer=viewer,
     )
@@ -325,21 +406,30 @@ def main():
         )
     viewer.scene.current_frame_id = args.frame
 
-    logical_size = tuple(viewer.window_size)
+    if not args.headless:
+        logical_size = tuple(viewer.window_size)
     framebuffer_size = tuple(viewer.wnd.buffer_size)
     pixel_ratio = float(viewer.wnd.pixel_ratio)
-    export_scale = pixel_ratio if args.export_scale is None else args.export_scale
-    max_scale = min(
-        framebuffer_size[0] / logical_size[0],
-        framebuffer_size[1] / logical_size[1],
-    )
-    if export_scale > max_scale + 1e-6:
-        raise ValueError(
-            f"--export-scale {export_scale:g} exceeds framebuffer scale {max_scale:g}"
+    if args.headless:
+        export_size = tuple(viewer.window_size)
+    else:
+        export_scale = pixel_ratio if args.export_scale is None else args.export_scale
+        max_scale = min(
+            framebuffer_size[0] / logical_size[0],
+            framebuffer_size[1] / logical_size[1],
+        )
+        if export_scale > max_scale + 1e-6:
+            raise ValueError(
+                f"--export-scale {export_scale:g} exceeds framebuffer scale {max_scale:g}"
+            )
+        export_size = (
+            int(round(logical_size[0] * export_scale)),
+            int(round(logical_size[1] * export_scale)),
         )
 
     print(
         f"Loaded {motion['frame_count']} SMPL-X frames from {input_path.name}\n"
+        f"SMPL-X compute device: {compute_device}\n"
         f"Ground offset: {ground_offset:.3f} m\n"
         f"Camera: distance={camera_distance:.3f} m, height={args.camera_height:.3f} m, "
         f"yaw={args.camera_yaw:.1f} deg\n"
@@ -362,11 +452,12 @@ def main():
         return image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
 
     def set_export_viewport(enabled):
+        if args.headless:
+            # HeadlessRenderer owns an MSAA resolve framebuffer. Its built-in
+            # reader must remain installed, and the window is already final-size.
+            return export_size
         if enabled:
-            size = (
-                int(round(logical_size[0] * export_scale)),
-                int(round(logical_size[1] * export_scale)),
-            )
+            size = export_size
         else:
             size = logical_size
         viewer.window_size = size
@@ -432,6 +523,7 @@ def main():
         output = args.output or f"{input_path.stem}.png"
         viewer.export_frame(output)
         print(f"Frame saved to {Path(output).resolve()}")
+        viewer.close()
         return
 
     output = args.output or f"{input_path.stem}.mp4"
@@ -441,6 +533,8 @@ def main():
         viewer.scene.current_frame_id = args.frame
         print("Video saved; opening interactive AITViewer preview")
         viewer.run()
+    else:
+        viewer.close()
 
 
 if __name__ == "__main__":
