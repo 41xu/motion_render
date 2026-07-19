@@ -54,6 +54,16 @@ python mesh_render.py other.json --input-coordinates y_up --camera-yaw 180
 
 # Apply the JSON's jaw/expression animation instead of the neutral face
 python mesh_render.py other.json --use-face
+
+python mesh_render.py /path/to/motion.json \
+  --mode video \
+  --headless \
+  --models /path/to/body_models \
+  --output rendered_motion.mp4 \
+  --width 1440 \
+  --height 1440 \
+  --samples 8 \
+  --video-crf 18
 ```
 
 ### Single SMPL-X JSON on a headless NVIDIA server
