@@ -3,3 +3,9 @@ __pycache__
 .vscode
 .cursor
 
+*.mp4
+*.DS_Store
+*.log
+
+outputs/
+outputs_crf18/

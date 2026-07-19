@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -312,6 +313,12 @@ parser.add_argument(
     default=None,
     help="custom H.264 CRF via lossless PNG frames; try 18 for a sharper video",
 )
+parser.add_argument(
+    "--video-variants",
+    choices=("overlap", "source", "target", "all"),
+    default="overlap",
+    help="which visibility variant to export; all writes overlap/source/target videos",
+)
 args = parser.parse_args()
 
 print(
@@ -390,6 +397,7 @@ def set_export_viewport(enabled):
 
 renderer.playback_fps = FPS
 renderer.scene.add(smpl_seq, target_seq)
+renderer.scene.origin.enabled = False
 renderer.scene.light_mode = "default"
 renderer.scene.ambient_strength = args.ambient_strength
 for light in renderer.scene.lights:
@@ -501,6 +509,26 @@ def export_video(output_path, ffmpeg_executable):
         )
     print(f"Video saved to {os.path.abspath(output_path)} (CRF {args.video_crf})")
 
+
+def set_video_variant(variant):
+    """Change visibility only; camera, floor, colors and grounding stay fixed."""
+
+    smpl_seq.enabled = variant in ("overlap", "source")
+    target_seq.enabled = variant in ("overlap", "target")
+
+
+def variant_output_paths(output_path):
+    if args.video_variants != "all":
+        return [(args.video_variants, output_path)]
+
+    path = Path(output_path)
+    suffix = path.suffix or ".mp4"
+    stem = path.stem if path.suffix else path.name
+    return [
+        (variant, str(path.with_name(f"{stem}_{variant}{suffix}")))
+        for variant in ("overlap", "source", "target")
+    ]
+
 if args.mode == "preview":
     print("Opening AITViewer preview: source=red, target=green")
     renderer.run()
@@ -524,7 +552,12 @@ else:
     renderer._init_scene()
     export_size = set_export_viewport(True)
     print(f"Export resolution: {export_size[0]}x{export_size[1]}")
-    export_video(args.output or "test.mp4", ffmpeg_executable)
+    outputs = variant_output_paths(args.output or "test.mp4")
+    for variant, output_path in outputs:
+        set_video_variant(variant)
+        print(f"Exporting {variant} video -> {output_path}")
+        export_video(output_path, ffmpeg_executable)
+    set_video_variant("overlap")
     if args.mode == "both":
         set_export_viewport(False)
         renderer.scene.current_frame_id = args.frame
