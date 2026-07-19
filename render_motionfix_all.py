@@ -7,6 +7,7 @@ sample are caught so one bad entry doesn't stop the run.
 
 import argparse
 import gc
+import json
 import os
 import shutil
 import subprocess
@@ -327,24 +328,46 @@ def render_sample(
             return
         if not 0 <= args.video_crf <= 51:
             raise ValueError("--video-crf must be between 0 and 51")
-        with tempfile.TemporaryDirectory(prefix="motionfix_frames_") as frame_root:
+        temp_prefix = (
+            f"motionfix_w{args.worker_index}_frames_"
+            if args.worker_index is not None
+            else "motionfix_frames_"
+        )
+        with tempfile.TemporaryDirectory(
+            prefix=temp_prefix, dir=args.frame_temp_dir
+        ) as frame_root:
             renderer.export_video(output_path=None, frame_dir=frame_root, output_fps=FPS)
             frame_dir = os.path.join(frame_root, "0000")
-            subprocess.run(
+            command = [
+                ffmpeg_executable,
+                "-y",
+                "-loglevel",
+                "error",
+                "-framerate",
+                str(FPS),
+                "-i",
+                os.path.join(frame_dir, "frame_%06d.png"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "slow",
+            ]
+            if args.ffmpeg_threads is not None:
+                command.extend(["-threads", str(args.ffmpeg_threads)])
+            command.extend(
                 [
-                    ffmpeg_executable, "-y", "-loglevel", "error",
-                    "-framerate", str(FPS),
-                    "-i", os.path.join(frame_dir, "frame_%06d.png"),
-                    "-c:v", "libx264",
-                    "-preset", "slow",
-                    "-crf", str(args.video_crf),
-                    "-pix_fmt", "yuv420p",
-                    "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-                    "-movflags", "+faststart",
+                    "-crf",
+                    str(args.video_crf),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-vf",
+                    "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+                    "-movflags",
+                    "+faststart",
                     output_path,
-                ],
-                check=True,
+                ]
             )
+            subprocess.run(command, check=True)
 
     written = []
     try:
@@ -385,6 +408,212 @@ def resolve_ffmpeg():
     return ffmpeg_executable
 
 
+def write_failure_log(path, failures):
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8") as handle:
+        json.dump(failures, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, path)
+
+
+def prepare_dataset_shards(args, output_dir):
+    """Create reusable per-worker MotionFix files to avoid 8 full RAM copies."""
+
+    source_path = Path(args.motionfix_pth).expanduser().resolve()
+    source_stat = source_path.stat()
+    if args.shard_cache_dir is not None:
+        cache_dir = Path(args.shard_cache_dir).expanduser().resolve()
+    elif args.frame_temp_dir is not None:
+        cache_dir = (
+            Path(args.frame_temp_dir).expanduser().resolve()
+            / f"motionfix_shards_{args.workers}"
+        )
+    else:
+        cache_dir = output_dir / f".motionfix_shards_{args.workers}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_paths = [
+        cache_dir / f"motionfix.worker_{index:02d}.joblib"
+        for index in range(args.workers)
+    ]
+    metadata_path = cache_dir / "metadata.json"
+    expected_metadata = {
+        "source": str(source_path),
+        "source_size": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
+        "workers": args.workers,
+    }
+    if metadata_path.is_file() and all(
+        path.is_file() and path.stat().st_size > 0 for path in shard_paths
+    ):
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            if all(metadata.get(key) == value for key, value in expected_metadata.items()):
+                print(f"Reusing MotionFix worker shards from {cache_dir}")
+                return shard_paths
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    metadata_path.unlink(missing_ok=True)
+    print(f"Preparing {args.workers} reusable MotionFix shards in {cache_dir}")
+    print(f"Loading the full dataset once from {source_path}")
+    data_dict = joblib.load(source_path)
+    all_ids = sorted(data_dict.keys())
+    if args.sample_ids:
+        unknown_ids = sorted(set(args.sample_ids) - set(all_ids))
+        if unknown_ids:
+            raise ValueError(f"Unknown --sample-ids: {', '.join(unknown_ids)}")
+
+    shard_sizes = []
+    for worker_index, shard_path in enumerate(shard_paths):
+        assigned_ids = all_ids[worker_index :: args.workers]
+        shard_data = {sample_id: data_dict[sample_id] for sample_id in assigned_ids}
+        part_path = shard_path.with_name(f".{shard_path.name}.part")
+        part_path.unlink(missing_ok=True)
+        print(
+            f"Writing shard {worker_index}/{args.workers}: "
+            f"{len(assigned_ids)} samples -> {shard_path}"
+        )
+        joblib.dump(shard_data, part_path, compress=0)
+        os.replace(part_path, shard_path)
+        shard_sizes.append(len(assigned_ids))
+        del shard_data
+
+    metadata = {
+        **expected_metadata,
+        "sample_count": len(all_ids),
+        "shard_sizes": shard_sizes,
+    }
+    temporary_metadata = metadata_path.with_name(".metadata.json.tmp")
+    with temporary_metadata.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary_metadata, metadata_path)
+    del data_dict
+    gc.collect()
+    print(f"MotionFix shards ready: sizes={shard_sizes}")
+    return shard_paths
+
+
+def launch_parallel_workers(args):
+    if not args.headless:
+        raise ValueError("--workers greater than 1 requires --headless")
+    gpu_ids = args.gpu_ids if args.gpu_ids is not None else list(range(args.workers))
+    egl_device_ids = (
+        args.egl_device_ids if args.egl_device_ids is not None else gpu_ids
+    )
+    if len(gpu_ids) < args.workers:
+        raise ValueError("--gpu-ids must provide at least one CUDA GPU per worker")
+    if len(egl_device_ids) < args.workers:
+        raise ValueError(
+            "--egl-device-ids must provide at least one EGL device per worker"
+        )
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.frame_temp_dir is not None:
+        Path(args.frame_temp_dir).expanduser().resolve().mkdir(
+            parents=True, exist_ok=True
+        )
+    shard_paths = prepare_dataset_shards(args, output_dir)
+
+    cpu_count = os.cpu_count() or args.workers
+    ffmpeg_threads = args.ffmpeg_threads
+    if ffmpeg_threads is None:
+        ffmpeg_threads = max(1, cpu_count // args.workers)
+
+    for worker_index in range(args.workers):
+        (output_dir / f"render_failures.worker_{worker_index:02d}.json").unlink(
+            missing_ok=True
+        )
+    (output_dir / "render_failures.json").unlink(missing_ok=True)
+
+    print(
+        f"Launching {args.workers} workers across CUDA GPUs "
+        f"{gpu_ids[:args.workers]} and EGL devices {egl_device_ids[:args.workers]}"
+    )
+    print(
+        f"CPU allocation: {cpu_count} logical CPUs, "
+        f"{ffmpeg_threads} FFmpeg threads per worker"
+    )
+    processes = []
+    for worker_index in range(args.workers):
+        environment = os.environ.copy()
+        environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        environment["CUDA_VISIBLE_DEVICES"] = str(gpu_ids[worker_index])
+        environment["GLCONTEXT_DEVICE_INDEX"] = str(egl_device_ids[worker_index])
+        environment["PYTHONUNBUFFERED"] = "1"
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+            "--workers",
+            "1",
+            "--worker-index",
+            str(worker_index),
+            "--worker-count",
+            str(args.workers),
+            "--worker-data-pth",
+            str(shard_paths[worker_index]),
+            "--device",
+            "cuda:0",
+            "--ffmpeg-threads",
+            str(ffmpeg_threads),
+        ]
+        print(
+            f"Starting worker {worker_index}: CUDA GPU {gpu_ids[worker_index]}, "
+            f"EGL device {egl_device_ids[worker_index]}, data={shard_paths[worker_index]}"
+        )
+        processes.append(subprocess.Popen(command, env=environment))
+
+    try:
+        return_codes = [process.wait() for process in processes]
+    except KeyboardInterrupt:
+        print("Interrupted; terminating workers...")
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        return 130
+
+    combined_failures = []
+    for worker_index in range(args.workers):
+        worker_log = output_dir / f"render_failures.worker_{worker_index:02d}.json"
+        if worker_log.is_file():
+            try:
+                with worker_log.open("r", encoding="utf-8") as handle:
+                    combined_failures.extend(json.load(handle))
+            except (json.JSONDecodeError, OSError) as exc:
+                combined_failures.append(
+                    {
+                        "worker": worker_index,
+                        "error": f"Could not read worker failure log: {exc}",
+                    }
+                )
+
+    combined_log = output_dir / "render_failures.json"
+    if combined_failures:
+        write_failure_log(combined_log, combined_failures)
+        print(
+            f"Parallel run completed with {len(combined_failures)} sample failures: "
+            f"{combined_log}"
+        )
+    else:
+        combined_log.unlink(missing_ok=True)
+
+    crashed_workers = [
+        index for index, return_code in enumerate(return_codes) if return_code != 0
+    ]
+    if crashed_workers:
+        print(f"Workers with non-zero exit status: {crashed_workers}")
+        return 1
+    print("All parallel workers finished")
+    return 0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Batch render every MotionFix sample as source/target/overlap MP4s"
@@ -415,6 +644,29 @@ def parse_args():
         default=None,
         help="restrict batch to a subset of dataset keys",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="number of persistent GPU rendering processes (default: 1)",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="physical CUDA GPU IDs assigned to workers (default: 0..workers-1)",
+    )
+    parser.add_argument(
+        "--egl-device-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="EGL device indices; defaults to the corresponding --gpu-ids",
+    )
+    parser.add_argument("--worker-index", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-data-pth", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--width", type=int, default=720)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--samples", type=int, default=8, help="MSAA sample count")
@@ -459,11 +711,49 @@ def parse_args():
         default=None,
         help="custom H.264 CRF via lossless PNG frames; try 18 for a sharper video",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--ffmpeg-threads",
+        type=int,
+        default=None,
+        help="x264 threads per worker; parallel mode defaults to CPU count/workers",
+    )
+    parser.add_argument(
+        "--frame-temp-dir",
+        default=None,
+        help="directory for lossless PNG frames; use fast local NVMe when possible",
+    )
+    parser.add_argument(
+        "--shard-cache-dir",
+        default=None,
+        help="cache directory for reusable per-worker MotionFix data shards",
+    )
+    args = parser.parse_args()
+    if args.width <= 0 or args.height <= 0:
+        parser.error("--width and --height must be positive")
+    if args.export_scale is not None and args.export_scale <= 0:
+        parser.error("--export-scale must be positive")
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
+    if args.worker_count <= 0:
+        parser.error("--worker-count must be positive")
+    if args.worker_index is not None and not 0 <= args.worker_index < args.worker_count:
+        parser.error("--worker-index must be in [0, --worker-count)")
+    if args.gpu_ids is not None and any(gpu_id < 0 for gpu_id in args.gpu_ids):
+        parser.error("--gpu-ids must be non-negative")
+    if args.egl_device_ids is not None and any(
+        device_id < 0 for device_id in args.egl_device_ids
+    ):
+        parser.error("--egl-device-ids must be non-negative")
+    if args.ffmpeg_threads is not None and args.ffmpeg_threads <= 0:
+        parser.error("--ffmpeg-threads must be positive")
+    return args
 
 
 def main():
     args = parse_args()
+    if args.workers > 1 and args.worker_index is None:
+        return launch_parallel_workers(args)
+
     ffmpeg_executable = resolve_ffmpeg()
 
     C.smplx_models = str(Path(args.body_models).expanduser())
@@ -474,15 +764,37 @@ def main():
     print(f"SMPL compute device: {compute_device}")
     print(f"Body models: {C.smplx_models}")
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.frame_temp_dir is not None:
+        frame_temp_dir = Path(args.frame_temp_dir).expanduser().resolve()
+        frame_temp_dir.mkdir(parents=True, exist_ok=True)
+        args.frame_temp_dir = str(frame_temp_dir)
 
-    print(f"Loading MotionFix dataset from {args.motionfix_pth}")
-    data_dict = joblib.load(args.motionfix_pth)
-    all_ids = (
-        list(args.sample_ids) if args.sample_ids else sorted(data_dict.keys())
-    )
+    data_path = args.worker_data_pth or args.motionfix_pth
+    print(f"Loading MotionFix dataset from {data_path}")
+    data_dict = joblib.load(data_path)
+    if args.sample_ids:
+        all_ids = [sample_id for sample_id in args.sample_ids if sample_id in data_dict]
+        if args.worker_data_pth is None:
+            unknown_ids = sorted(set(args.sample_ids) - set(all_ids))
+            if unknown_ids:
+                raise ValueError(f"Unknown --sample-ids: {', '.join(unknown_ids)}")
+    else:
+        all_ids = sorted(data_dict.keys())
+    if not all_ids:
+        worker_label = (
+            f" for worker {args.worker_index}" if args.worker_index is not None else ""
+        )
+        print(f"No MotionFix samples selected{worker_label}")
+        return
     print(f"Rendering {len(all_ids)} samples into {output_dir.resolve()}")
+    if args.worker_index is not None:
+        print(
+            f"Worker {args.worker_index}/{args.worker_count}: "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+            f"GLCONTEXT_DEVICE_INDEX={os.environ.get('GLCONTEXT_DEVICE_INDEX')}"
+        )
 
     first = data_dict[all_ids[0]]
     n_joints = np.asarray(first["motion_source"]["joint_positions"]).shape[1]
@@ -494,6 +806,11 @@ def main():
     renderer = create_batch_renderer(args)
 
     failures = []
+    failure_log = (
+        output_dir / f"render_failures.worker_{args.worker_index:02d}.json"
+        if args.worker_index is not None
+        else output_dir / "render_failures.json"
+    )
     start_time = time.time()
     try:
         for i, sid in enumerate(all_ids, 1):
@@ -511,7 +828,13 @@ def main():
                 )
             except Exception as exc:
                 traceback.print_exc()
-                failures.append((sid, str(exc)))
+                failures.append({"id": sid, "error": str(exc)})
+                write_failure_log(failure_log, failures)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
 
             if args.gc_interval and i % args.gc_interval == 0:
                 gc.collect()
@@ -526,11 +849,11 @@ def main():
 
     total = time.time() - start_time
     print(f"\nDone in {total:.1f}s. Rendered {len(all_ids) - len(failures)}/{len(all_ids)} samples.")
+    if not failures:
+        failure_log.unlink(missing_ok=True)
     if failures:
-        print(f"{len(failures)} failures:")
-        for sid, err in failures:
-            print(f"  {sid}: {err}")
+        print(f"{len(failures)} failures; details: {failure_log}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

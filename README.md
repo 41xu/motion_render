@@ -143,6 +143,31 @@ The script prints both the CUDA compute device and the OpenGL vendor/renderer at
 startup. On the H200 server the OpenGL renderer should contain `NVIDIA H200`;
 the script rejects known software renderers such as `llvmpipe` in headless mode.
 
+For eight GPUs, keep the same source/target/overlap rendering and CRF 18 PNG +
+x264 `slow` quality while distributing independent samples across workers:
+
+```bash
+python render_motionfix_all.py \
+  --headless \
+  --workers 8 \
+  --gpu-ids 0 1 2 3 4 5 6 7 \
+  --motionfix-pth /path/to/motionfix.pth.tar \
+  --body-models /path/to/body_models \
+  --output-dir motionfix_renders \
+  --frame-temp-dir /path/to/fast-local-nvme/motionfix_frames \
+  --shard-cache-dir /path/to/fast-local-nvme/motionfix_shards_8 \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+```
+
+The original MotionFix file stores tensors inline, so joblib memory mapping
+cannot share it. On the first parallel run the parent loads it once and creates
+eight reusable shard files (about the same total size as the original dataset).
+Each worker then loads only about one eighth instead of copying the complete
+5 GB dataset. Later runs reuse the shard cache as long as the source file size
+and modification time have not changed.
+
 ## Batch render MotionX++ SMPL-X JSON files
 
 `render_mesh_all.py` reads the `id` and `motion` fields from
