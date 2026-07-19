@@ -108,3 +108,36 @@ python render_motionfix_all.py \
 The script prints both the CUDA compute device and the OpenGL vendor/renderer at
 startup. On the H200 server the OpenGL renderer should contain `NVIDIA H200`;
 the script rejects known software renderers such as `llvmpipe` in headless mode.
+
+## Batch render MotionX++ SMPL-X JSON files
+
+`render_mesh_all.py` reads the `id` and `motion` fields from
+`motionx++_test_render.json`, then writes one `<id>.mp4` per entry. It reuses one
+SMPL-X layer and one OpenGL context, skips completed outputs, writes MP4s
+atomically, and records individual failures without stopping the batch.
+
+```bash
+# H200/EGL smoke test: render the first two entries at 1440x1440.
+python render_mesh_all.py motionx++_test_render.json \
+  --headless \
+  --models /path/to/body_models \
+  --output-dir motionxpp_renders \
+  --limit 2 \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+
+# Full batch: remove --limit. Re-running resumes completed outputs.
+python render_mesh_all.py motionx++_test_render.json \
+  --headless \
+  --models /path/to/body_models \
+  --output-dir motionxpp_renders \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+```
+
+The manifest already contains absolute server paths. If the dataset is moved,
+pass `--motion-root /new/path/to/global_motion`; category subdirectories such as
+`animation`, `idea400`, and `haa500` are preserved. Failures are written to
+`<output-dir>/render_failures.json`.
