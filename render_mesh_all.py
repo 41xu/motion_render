@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import traceback
@@ -293,27 +294,38 @@ def export_video(viewer, output_path, args, ffmpeg):
         )
         return
 
-    with tempfile.TemporaryDirectory(prefix="mesh_batch_frames_") as frame_root:
+    temp_prefix = (
+        f"mesh_batch_w{args.worker_index}_frames_"
+        if args.worker_index is not None
+        else "mesh_batch_frames_"
+    )
+    with tempfile.TemporaryDirectory(
+        prefix=temp_prefix, dir=args.frame_temp_dir
+    ) as frame_root:
         viewer.export_video(
             output_path=None,
             frame_dir=frame_root,
             output_fps=args.fps,
         )
         frame_dir = os.path.join(frame_root, "0000")
-        subprocess.run(
+        command = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(args.fps),
+            "-i",
+            os.path.join(frame_dir, "frame_%06d.png"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+        ]
+        if args.ffmpeg_threads is not None:
+            command.extend(["-threads", str(args.ffmpeg_threads)])
+        command.extend(
             [
-                ffmpeg,
-                "-y",
-                "-loglevel",
-                "error",
-                "-framerate",
-                str(args.fps),
-                "-i",
-                os.path.join(frame_dir, "frame_%06d.png"),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "slow",
                 "-crf",
                 str(args.video_crf),
                 "-pix_fmt",
@@ -323,9 +335,9 @@ def export_video(viewer, output_path, args, ffmpeg):
                 "-movflags",
                 "+faststart",
                 str(output_path),
-            ],
-            check=True,
+            ]
         )
+        subprocess.run(command, check=True)
 
 
 def render_one(record, input_path, output_path, smpl_layer, viewer, args, ffmpeg):
@@ -372,6 +384,123 @@ def write_failure_log(path, failures):
     with temporary_path.open("w", encoding="utf-8") as handle:
         json.dump(failures, handle, ensure_ascii=False, indent=2)
     os.replace(temporary_path, path)
+
+
+def launch_parallel_workers(args):
+    """Launch one persistent rendering subprocess per GPU."""
+
+    if not args.headless:
+        raise ValueError("--workers greater than 1 requires --headless")
+    gpu_ids = args.gpu_ids if args.gpu_ids is not None else list(range(args.workers))
+    egl_device_ids = (
+        args.egl_device_ids if args.egl_device_ids is not None else gpu_ids
+    )
+    if len(gpu_ids) < args.workers:
+        raise ValueError("--gpu-ids must provide at least one CUDA GPU per worker")
+    if len(egl_device_ids) < args.workers:
+        raise ValueError(
+            "--egl-device-ids must provide at least one EGL device per worker"
+        )
+
+    cpu_count = os.cpu_count() or args.workers
+    ffmpeg_threads = args.ffmpeg_threads
+    if ffmpeg_threads is None:
+        ffmpeg_threads = max(1, cpu_count // args.workers)
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for worker_index in range(args.workers):
+        (output_dir / f"render_failures.worker_{worker_index:02d}.json").unlink(
+            missing_ok=True
+        )
+    (output_dir / "render_failures.json").unlink(missing_ok=True)
+    print(
+        f"Launching {args.workers} workers across CUDA GPUs "
+        f"{gpu_ids[:args.workers]} and EGL devices {egl_device_ids[:args.workers]}"
+    )
+    print(
+        f"CPU allocation: {cpu_count} logical CPUs, "
+        f"{ffmpeg_threads} FFmpeg threads per worker"
+    )
+
+    processes = []
+    for worker_index in range(args.workers):
+        cuda_gpu = gpu_ids[worker_index]
+        egl_device = egl_device_ids[worker_index]
+        environment = os.environ.copy()
+        environment["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        environment["CUDA_VISIBLE_DEVICES"] = str(cuda_gpu)
+        environment["GLCONTEXT_DEVICE_INDEX"] = str(egl_device)
+        environment["PYTHONUNBUFFERED"] = "1"
+
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            *sys.argv[1:],
+            "--workers",
+            "1",
+            "--worker-index",
+            str(worker_index),
+            "--worker-count",
+            str(args.workers),
+            "--device",
+            "cuda:0",
+            "--ffmpeg-threads",
+            str(ffmpeg_threads),
+        ]
+        print(
+            f"Starting worker {worker_index}: CUDA GPU {cuda_gpu}, "
+            f"EGL device {egl_device}"
+        )
+        processes.append(subprocess.Popen(command, env=environment))
+
+    try:
+        return_codes = [process.wait() for process in processes]
+    except KeyboardInterrupt:
+        print("Interrupted; terminating workers...")
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        return 130
+
+    combined_failures = []
+    for worker_index in range(args.workers):
+        worker_failure_log = output_dir / f"render_failures.worker_{worker_index:02d}.json"
+        if worker_failure_log.is_file():
+            try:
+                with worker_failure_log.open("r", encoding="utf-8") as handle:
+                    combined_failures.extend(json.load(handle))
+            except (json.JSONDecodeError, OSError) as exc:
+                combined_failures.append(
+                    {
+                        "worker": worker_index,
+                        "error": f"Could not read worker failure log: {exc}",
+                    }
+                )
+
+    combined_failure_log = output_dir / "render_failures.json"
+    if combined_failures:
+        write_failure_log(combined_failure_log, combined_failures)
+        print(
+            f"Parallel run completed with {len(combined_failures)} sample failures: "
+            f"{combined_failure_log}"
+        )
+    else:
+        combined_failure_log.unlink(missing_ok=True)
+
+    crashed_workers = [
+        index for index, return_code in enumerate(return_codes) if return_code != 0
+    ]
+    if crashed_workers:
+        print(f"Workers with non-zero exit status: {crashed_workers}")
+        return 1
+    print("All parallel workers finished")
+    return 0
 
 
 def parse_args():
@@ -423,6 +552,28 @@ def parse_args():
         help="render at most this many manifest entries",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="number of persistent GPU rendering processes (default: 1)",
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="physical CUDA GPU IDs assigned to workers (default: 0..workers-1)",
+    )
+    parser.add_argument(
+        "--egl-device-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="EGL device indices; defaults to the corresponding --gpu-ids",
+    )
+    parser.add_argument("--worker-index", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--worker-count", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument(
         "--gender", choices=("neutral", "female", "male"), default="neutral"
     )
     parser.add_argument("--fps", type=float, default=30.0)
@@ -464,6 +615,17 @@ def parse_args():
         default=25,
         help="run Python/GPU cache cleanup every N entries; 0 disables it",
     )
+    parser.add_argument(
+        "--ffmpeg-threads",
+        type=int,
+        default=None,
+        help="x264 threads per worker; parallel mode defaults to CPU count/workers",
+    )
+    parser.add_argument(
+        "--frame-temp-dir",
+        default=None,
+        help="directory for lossless PNG frames; use fast local NVMe when possible",
+    )
     args = parser.parse_args()
 
     if args.width <= 0 or args.height <= 0:
@@ -478,11 +640,28 @@ def parse_args():
         parser.error("--start-index must be non-negative")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
+    if args.workers <= 0:
+        parser.error("--workers must be positive")
+    if args.gpu_ids is not None and any(gpu_id < 0 for gpu_id in args.gpu_ids):
+        parser.error("--gpu-ids must be non-negative")
+    if args.egl_device_ids is not None and any(
+        device_id < 0 for device_id in args.egl_device_ids
+    ):
+        parser.error("--egl-device-ids must be non-negative")
+    if args.worker_count <= 0:
+        parser.error("--worker-count must be positive")
+    if args.worker_index is not None and not 0 <= args.worker_index < args.worker_count:
+        parser.error("--worker-index must be in [0, --worker-count)")
+    if args.ffmpeg_threads is not None and args.ffmpeg_threads <= 0:
+        parser.error("--ffmpeg-threads must be positive")
     return args
 
 
 def main():
     args = parse_args()
+    if args.workers > 1 and args.worker_index is None:
+        return launch_parallel_workers(args)
+
     manifest_path = Path(args.manifest).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -498,9 +677,19 @@ def main():
     records = records[args.start_index :]
     if args.limit is not None:
         records = records[: args.limit]
+    if args.worker_index is not None:
+        records = records[args.worker_index :: args.worker_count]
     if not records:
-        print("No manifest entries selected")
+        worker_label = (
+            f" for worker {args.worker_index}" if args.worker_index is not None else ""
+        )
+        print(f"No manifest entries selected{worker_label}")
         return
+
+    if args.frame_temp_dir is not None:
+        frame_temp_dir = Path(args.frame_temp_dir).expanduser().resolve()
+        frame_temp_dir.mkdir(parents=True, exist_ok=True)
+        args.frame_temp_dir = str(frame_temp_dir)
 
     C.smplx_models = str(Path(args.models).expanduser())
     C.auto_set_floor = False
@@ -512,6 +701,12 @@ def main():
     print(f"Output directory: {output_dir}")
     print(f"SMPL-X compute device: {compute_device}")
     print(f"Body models: {C.smplx_models}")
+    if args.worker_index is not None:
+        print(
+            f"Worker {args.worker_index}/{args.worker_count}: "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+            f"GLCONTEXT_DEVICE_INDEX={os.environ.get('GLCONTEXT_DEVICE_INDEX')}"
+        )
 
     ffmpeg = find_ffmpeg()
     smpl_layer = SMPLLayer(
@@ -527,7 +722,11 @@ def main():
     rendered = 0
     skipped = 0
     start_time = time.time()
-    failure_log = output_dir / "render_failures.json"
+    failure_log = (
+        output_dir / f"render_failures.worker_{args.worker_index:02d}.json"
+        if args.worker_index is not None
+        else output_dir / "render_failures.json"
+    )
     try:
         for index, record in enumerate(records, 1):
             elapsed = time.time() - start_time
@@ -597,4 +796,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main() or 0)

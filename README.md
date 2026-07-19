@@ -171,6 +171,29 @@ python render_mesh_all.py motionx++_test_render.json \
   --video-crf 18
 ```
 
+For an 8-GPU headless server, keep the same CRF 18 / x264 `slow` quality and
+parallelize independent motions across eight persistent workers:
+
+```bash
+python render_mesh_all.py motionx++_test_render.json \
+  --headless \
+  --workers 8 \
+  --gpu-ids 0 1 2 3 4 5 6 7 \
+  --models /path/to/body_models \
+  --output-dir motionxpp_renders \
+  --frame-temp-dir /path/to/fast-local-nvme/render_frames \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+```
+
+Each worker gets one `CUDA_VISIBLE_DEVICES` value for SMPL-X and one
+`GLCONTEXT_DEVICE_INDEX` for EGL/OpenGL, and reuses its context for its whole
+shard. The selected manifest range is distributed by striding, so workers never
+write the same MP4. Per-worker failure logs are combined into
+`<output-dir>/render_failures.json`. If EGL enumeration differs from CUDA
+enumeration, pass the explicit order with `--egl-device-ids`.
+
 The manifest already contains absolute server paths. If the dataset is moved,
 pass `--motion-root /new/path/to/global_motion`; category subdirectories such as
 `animation`, `idea400`, and `haa500` are preserved. Failures are written to
