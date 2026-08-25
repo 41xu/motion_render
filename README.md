@@ -17,6 +17,11 @@ aitviewer
 
 `mesh_render` for a single SMPL-X JSON motion in motionx++
 
+`pkl_render` only for a PromptHMR results `.pkl` (`people[track]["smplx_world"]`)
+
+`general_smplx_pkl_render` for common SMPL-X `.pkl` layouts, including
+MoSh++/SOMA `fullpose` + `trans` + `betas` files
+
 ## MotionFix preview
 
 ```bash
@@ -89,6 +94,79 @@ python mesh_render.py /path/to/motion.json \
   --output rendered_motion.png \
   --width 1440 --height 1440
 ```
+
+## General SMPL-X pkl
+
+`general_smplx_pkl_render.py` renders common single-person SMPL-X pickle
+layouts. It accepts a flat full pose in `(F, 165)` axis-angle,
+`(F, 55, 3)` axis-angle, or `(F, 55, 3, 3)` rotation-matrix form, as well as
+files with separate root, body, face, and hand pose fields. Common aliases for
+translation and betas are recognized. Missing translation or betas default to
+zero. PromptHMR files are also accepted and delegated to their original loader.
+
+For the MoSh++/SOMA-style `yoga.pkl`, the stored metadata says SMPL-X female at
+60 FPS. MoSh++ mocap coordinates are Z-up, so render it with:
+
+```bash
+python general_smplx_pkl_render.py yoga.pkl \
+  --mode video \
+  --headless \
+  --models /path/to/body_models \
+  --output yoga.mp4 \
+  --gender female \
+  --fps 60 \
+  --hand-mode stored \
+  --input-coordinates z_up \
+  --video-crf 18
+```
+
+Use `--input-coordinates y_up` for files that have already been converted to
+AITViewer's Y-up world.
+
+## PromptHMR SMPL-X pkl
+
+`pkl_render.py` is the dedicated PromptHMR renderer; it does not read generic
+flat SMPL-X pickle files. It expects
+`people[<track>]["smplx_world"]`, which stores the grounded world motion as a
+full SMPL-X pose (55 joints, axis-angle, 165 values), plus `shape` and `trans`.
+The `smplx_world` motion is already Y-up and floor-fitted, so the renderer only
+re-grounds on Y=0, estimates the body's front, and fits one fixed camera for the
+whole sequence, using the same MotionFix-style palette/floor as `mesh_render`.
+
+```bash
+# H200/EGL: 1440x1440 MP4 (all detected people, green/red/... per track).
+python pkl_render.py source.pkl \
+  --mode video \
+  --headless \
+  --models /path/to/body_models \
+  --output source.mp4 \
+  --width 1440 --height 1440 \
+  --samples 8 \
+  --video-crf 18
+
+# Export one PNG instead.
+python pkl_render.py source.pkl --mode frame --headless \
+  --models /path/to/body_models --output source.png \
+  --width 1440 --height 1440
+
+# Interactive preview (needs a DISPLAY).
+python pkl_render.py source.pkl
+
+# Choose the body color (red is MotionFix source, green is target).
+python pkl_render.py source.pkl --color green
+
+# Render only one track, or flip the camera if it shows the back.
+python pkl_render.py source.pkl --track 1 --camera-yaw 180
+
+# Render the camera-frame pose (smplx_cam) instead of the world motion.
+python pkl_render.py source.pkl --source smplx_cam --input-coordinates camera
+```
+
+Fingers default to `--hand-mode flat` (the zero/straight open hand). Use
+`--hand-mode smplh_mean` for the SMPL-H mean hand (a relaxed, slightly curled
+pose), or `--hand-mode stored` to keep the pkl hand pose (unreliable when
+`has_hands` is False). Betas are taken as the per-sequence median for a stable
+shape.
 
 ## Batch render all MotionFix samples
 

@@ -9,3 +9,8 @@ __pycache__
 
 outputs/
 outputs_crf18/
+
+motionfix_render/
+motionx++_test_render/
+
+*.pkl

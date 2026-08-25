@@ -7,6 +7,7 @@ The expected manifest is a list of objects such as::
 One AITViewer/OpenGL context and one SMPL-X layer are reused for the entire
 batch. Existing MP4s are skipped, and each completed output is installed
 atomically so an interrupted run can safely be resumed.
+render motionx++ data
 """
 
 import argparse
